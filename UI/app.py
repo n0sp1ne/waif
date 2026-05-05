@@ -43,7 +43,7 @@ with st.sidebar:
     st.markdown("## Navigation")
     page = st.radio(
         label="Page",
-        options=["Overview", "Section 1", "Section 2", "Settings"],
+        options=["Overview", "Section 1", "AI Fetch", "Section 2", "Settings"],
         label_visibility="collapsed",
     )
 
@@ -144,6 +144,95 @@ elif page == "Section 1":
             )
 
 # ─────────────────────────────────────────────────────────────────────────────
+elif page == "AI Fetch":
+    st.subheader("AI-Powered Data Fetch")
+    st.caption(
+        "Describe the stock or instrument in plain language. "
+        "The agent uses a local Ollama LLM + DuckDuckGo to resolve the ticker, "
+        "then downloads OHLCV data from yfinance (with stooq.com as fallback)."
+    )
+
+    col_q, col_d = st.columns([3, 1])
+    with col_q:
+        ai_query = st.text_input(
+            "Query",
+            placeholder="e.g. Reliance Industries, Apple stock, Nifty Bank, Gold ETF",
+            key="ai_query",
+        )
+    with col_d:
+        ai_from_date = st.date_input("From Date", key="ai_from_date")
+
+    with st.expander("Advanced", expanded=False):
+        ai_model = st.text_input(
+            "Ollama model",
+            value="llama3.1:8b",
+            help="Run `ollama list` to see installed models. Pull with `ollama pull llama3.1:8b`.",
+            key="ai_model",
+        )
+
+    if st.button("Fetch with AI Agent", type="primary"):
+        if not ai_query.strip():
+            st.warning("Please enter a query.")
+        else:
+            try:
+                from fetch_data_agent import FetchDataAgent  # noqa: PLC0415
+
+                agent = FetchDataAgent(model=ai_model)
+
+                with st.status("Running AI agent…", expanded=True) as _status:
+                    def _log(msg: str) -> None:
+                        st.write(msg)
+
+                    try:
+                        df = agent.fetch(ai_query.strip(), str(ai_from_date), log=_log)
+                        _status.update(
+                            label=f"Done — fetched {len(df)} rows", state="complete"
+                        )
+                    except Exception as _exc:
+                        _status.update(label=f"Failed: {_exc}", state="error")
+                        raise
+
+                ai_key = f"{ai_query.strip().upper().replace(' ', '_')}_{ai_from_date}"
+                st.session_state["datasets"][ai_key] = df
+                st.session_state["last_fetched"] = ai_key
+                st.success(f"Fetched **{len(df)} rows** for **{ai_query}** — added to datasets as `{ai_key}`")
+
+                st.dataframe(df, use_container_width=True)
+
+                buf = io.StringIO()
+                df.to_csv(buf)
+                csv_str = buf.getvalue()
+
+                dl_col, cp_col = st.columns(2)
+                with dl_col:
+                    st.download_button(
+                        label="⬇ Download CSV",
+                        data=csv_str,
+                        file_name=f"{ai_key}.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                    )
+                with cp_col:
+                    st.components.v1.html(  # type: ignore
+                        _copy_button_html(csv_str),
+                        height=46,
+                    )
+
+            except RuntimeError as exc:
+                if "Ollama" in str(exc):
+                    st.error(str(exc))
+                    st.info(
+                        "**Quick setup:**\n"
+                        "1. Download Ollama → https://ollama.com\n"
+                        "2. In a terminal: `ollama serve`\n"
+                        f"3. Pull the model: `ollama pull llama3.1:8b`"
+                    )
+                else:
+                    st.error(str(exc))
+            except Exception as exc:
+                st.error(f"Unexpected error: {exc}")
+
+# ─────────────────────────────────────────────────────────────────────────────
 elif page == "Section 2":
     st.subheader("Portfolio Builder")
 
@@ -202,25 +291,92 @@ elif page == "Section 2":
                 selected_keys.append(key)
                 weight_map[key] = w
 
+        # ── Rebalancing config ─────────────────────────────────────────────────
+        st.divider()
+        st.markdown("#### Rebalancing")
+        st.caption(
+            "Set how many **trading days** between each rebalance. "
+            "On a rebalance date the portfolio is sold/bought back to the original target weights. "
+            "Set to **0** to disable rebalancing."
+        )
+        rebalance_days = int(st.number_input(
+            "Rebalance every N trading days",
+            min_value=0,
+            max_value=3650,
+            value=0,
+            step=1,
+            key="rebalance_days",
+            label_visibility="collapsed",
+        ))
+        if rebalance_days > 0:
+            st.info(f"Portfolio will be rebalanced every **{rebalance_days} trading days**.")
+
         # ── Portfolio calculation ──────────────────────────────────────────────
         if selected_keys:
             st.divider()
             st.markdown("### Portfolio Performance")
 
-            series_dict: dict = {}
+            # Gather close prices for selected instruments
+            closes: dict = {}
             for key in selected_keys:
                 df    = datasets[key]
                 close = df["Close"].dropna()
                 if close.empty:
                     st.warning(f"{key}: no Close data, skipped.")
-                    continue
-                base             = float(close.iloc[0])
-                initial          = weight_map[key] * 100.0
-                series_dict[key] = (close / base) * initial
+                else:
+                    closes[key] = close
 
-            if series_dict:
-                combined          = pd.DataFrame(series_dict)
-                combined.index    = pd.to_datetime(combined.index)
+            if closes:
+                # Align on common trading dates
+                combined_close = pd.DataFrame(closes)
+                combined_close.index = pd.to_datetime(combined_close.index)
+                combined_close = combined_close.sort_index().ffill().dropna()
+
+                total_weight = sum(weight_map[k] for k in closes)
+
+                # Initial share count for each instrument
+                shares = {
+                    key: (weight_map[key] * 100.0) / float(combined_close[key].iloc[0])
+                    for key in closes
+                }
+
+                rebalance_log: list = []
+                portfolio_values: dict = {key: [] for key in closes}
+                last_rebalance_idx = 0
+                dates = combined_close.index
+
+                for i in range(len(dates)):
+                    cur_vals = {
+                        key: shares[key] * float(combined_close[key].iloc[i])
+                        for key in closes
+                    }
+
+                    # Rebalance if threshold reached
+                    if rebalance_days > 0 and i > 0 and (i - last_rebalance_idx) >= rebalance_days:
+                        total_val  = sum(cur_vals.values())
+                        before_vals = cur_vals.copy()
+                        for key in closes:
+                            target_frac = weight_map[key] / total_weight
+                            shares[key] = (target_frac * total_val) / float(combined_close[key].iloc[i])
+                        cur_vals = {
+                            key: shares[key] * float(combined_close[key].iloc[i])
+                            for key in closes
+                        }
+                        log_row: dict = {
+                            "Date":         str(dates[i].date()),
+                            "Total Before": round(sum(before_vals.values()), 2),
+                            "Total After":  round(sum(cur_vals.values()), 2),
+                        }
+                        for key in closes:
+                            log_row[f"{key} Before"] = round(before_vals[key], 2)
+                            log_row[f"{key} After"]  = round(cur_vals[key], 2)
+                        rebalance_log.append(log_row)
+                        last_rebalance_idx = i
+
+                    for key in closes:
+                        portfolio_values[key].append(cur_vals[key])
+
+                combined          = pd.DataFrame(portfolio_values, index=dates)
                 combined["Total"] = combined.sum(axis=1)
 
                 # ── Benchmark series (100 units, no weight) ────────────────
@@ -236,12 +392,16 @@ elif page == "Section 2":
                 ret_pct = ((t_end - t_start) / t_start) * 100 if t_start else 0.0
                 pnl     = t_end - t_start
 
+                years = (dates[-1] - dates[0]).days / 365.25
+                port_cagr = ((t_end / t_start) ** (1 / years) - 1) * 100 if years > 0 and t_start else 0.0
+
                 # Benchmark comparison metrics
                 if has_benchmark:
-                    bm_col = f"Benchmark ({benchmark_key})"
+                    bm_col   = f"Benchmark ({benchmark_key})"
                     bm_start = float(combined[bm_col].iloc[0])
                     bm_end   = float(combined[bm_col].iloc[-1])
                     bm_ret   = ((bm_end - bm_start) / bm_start) * 100 if bm_start else 0.0
+                    bm_cagr  = ((bm_end / bm_start) ** (1 / years) - 1) * 100 if years > 0 and bm_start else 0.0
                     alpha    = ret_pct - bm_ret
 
                     m1, m2, m3, m4, m5 = st.columns(5)
@@ -251,6 +411,12 @@ elif page == "Section 2":
                     m4.metric("Portfolio Return",    f"{ret_pct:+.2f}%")
                     m5.metric("Alpha vs Benchmark",  f"{alpha:+.2f}%",
                               delta=f"Benchmark: {bm_ret:+.2f}%")
+
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Holding Period", f"{years:.2f} yrs")
+                    c2.metric("Index CAGR",     f"{port_cagr:+.2f}%")
+                    c3.metric("Benchmark CAGR", f"{bm_cagr:+.2f}%",
+                              delta=f"vs Index: {port_cagr - bm_cagr:+.2f}%")
                 else:
                     m1, m2, m3, m4 = st.columns(4)
                     m1.metric("Initial Investment", f"₹{t_start:,.2f}")
@@ -258,9 +424,49 @@ elif page == "Section 2":
                     m3.metric("P&L",                 f"₹{pnl:+,.2f}")
                     m4.metric("Total Return",        f"{ret_pct:+.2f}%")
 
+                    c1, c2 = st.columns(2)
+                    c1.metric("Holding Period", f"{years:.2f} yrs")
+                    c2.metric("Index CAGR",     f"{port_cagr:+.2f}%")
+
                 st.divider()
                 st.markdown("**Daily Portfolio Value**")
-                st.line_chart(combined, use_container_width=True)
+
+                # ── Series visibility checkboxes ───────────────────────────
+                all_series = list(closes.keys()) + ["Total"]
+                if has_benchmark:
+                    bm_col_name = f"Benchmark ({benchmark_key})"
+                    all_series.append(bm_col_name)
+
+                st.caption("Select series to display:")
+                cb_cols = st.columns(len(all_series))
+                visible_series = []
+                for idx, series in enumerate(all_series):
+                    default = True  # show all by default
+                    label = series if series in ("Total",) or series.startswith("Benchmark") else series
+                    checked = cb_cols[idx].checkbox(
+                        label,
+                        value=default,
+                        key=f"vis_{series}",
+                    )
+                    if checked:
+                        visible_series.append(series)
+
+                if visible_series:
+                    chart_df = combined[[s for s in visible_series if s in combined.columns]]
+                    st.line_chart(chart_df, use_container_width=True)
+                else:
+                    st.info("Select at least one series to display the chart.")
+
+                # ── Rebalance log ──────────────────────────────────────────
+                if rebalance_log:
+                    st.divider()
+                    with st.expander(f"Rebalance Log ({len(rebalance_log)} events)"):
+                        st.caption(
+                            "Each row shows the portfolio value immediately before and after rebalancing. "
+                            "Total Before = Total After because the overall portfolio value is unchanged; "
+                            "only the allocation between instruments shifts."
+                        )
+                        st.dataframe(pd.DataFrame(rebalance_log).set_index("Date"), use_container_width=True)
 
                 st.divider()
                 st.markdown("**Daily Values Table**")

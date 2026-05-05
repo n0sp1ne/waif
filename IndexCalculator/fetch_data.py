@@ -14,6 +14,8 @@ INDEX_MAP = {
     "NIFTYNEXT50": "^NSMIDCP",
     "NIFTYIT": "^CNXIT",
     "SENSEX": "^BSESN",
+    "GOLDBEES": "GOLDBEES",
+    "SILVERBEES": "SILVERBEES"
 }
 
 
