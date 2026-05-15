@@ -1,7 +1,6 @@
 import sys
 import os
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "IndexCalculator"))
-from fetch_data import fetch_data
 
 import base64
 import io
@@ -15,6 +14,14 @@ if "datasets" not in st.session_state:
     st.session_state["datasets"] = {}   # key → DataFrame
 if "last_fetched" not in st.session_state:
     st.session_state["last_fetched"] = None
+if "screener_results" not in st.session_state:
+    st.session_state["screener_results"] = {}  # industry → [stock_dicts]
+if "ai_candidates" not in st.session_state:
+    st.session_state["ai_candidates"] = None   # list[dict] when awaiting user choice
+if "ai_pending_query" not in st.session_state:
+    st.session_state["ai_pending_query"] = None
+if "ai_pending_date" not in st.session_state:
+    st.session_state["ai_pending_date"] = None
 
 # ── Header ────────────────────────────────────────────────────────────────────
 st.markdown(
@@ -43,7 +50,7 @@ with st.sidebar:
     st.markdown("## Navigation")
     page = st.radio(
         label="Page",
-        options=["Overview", "Section 1", "AI Fetch", "Section 2", "Settings"],
+        options=["Overview", "AI Fetch", "Screener", "Section 2", "Settings"],
         label_visibility="collapsed",
     )
 
@@ -54,6 +61,26 @@ with st.sidebar:
     st.metric("Tasks", "0 active")
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+def _dedup_datasets() -> None:
+    """For each instrument, keep only the entry whose date starts earliest."""
+    datasets = st.session_state["datasets"]
+    groups: dict[str, list[str]] = {}
+    for key in list(datasets.keys()):
+        name, _, date_str = key.rpartition("_")
+        group_key = name if name else key
+        groups.setdefault(group_key, []).append(key)
+
+    for keys in groups.values():
+        if len(keys) <= 1:
+            continue
+        keys_sorted = sorted(keys, key=lambda k: k.rpartition("_")[2])
+        to_keep = keys_sorted[0]
+        for k in keys_sorted[1:]:
+            del datasets[k]
+            if st.session_state.get("last_fetched") == k:
+                st.session_state["last_fetched"] = to_keep
+
+
 def _copy_button_html(csv_str: str, button_label: str = "📋 Copy to Clipboard") -> str:
     """Return an HTML snippet with a JS-powered copy-to-clipboard button."""
     b64 = base64.b64encode(csv_str.encode("utf-8")).decode("utf-8")
@@ -97,61 +124,31 @@ if page == "Overview":
     st.info("Welcome to the WAIF dashboard. Use the sidebar to navigate.")
 
 # ─────────────────────────────────────────────────────────────────────────────
-elif page == "Section 1":
-    st.subheader("Fetch NSE Data")
-
-    instrument = st.text_input("Instrument", placeholder="e.g. RELIANCE, NIFTY, BANKNIFTY")
-    from_date  = st.date_input("From Date")
-
-    if st.button("Fetch Data"):
-        if not instrument:
-            st.warning("Please enter an instrument symbol.")
-        else:
-            with st.spinner("Fetching data from NSE..."):
-                try:
-                    df  = fetch_data(instrument, str(from_date))
-                    key = f"{instrument.strip().upper()}_{from_date}"
-                    st.session_state["datasets"][key]  = df
-                    st.session_state["last_fetched"]   = key
-                    st.success(f"Fetched {len(df)} rows for **{instrument.upper()}**")
-                except Exception as e:
-                    st.error(f"Error: {e}")
-
-    # Show data + export options for the most recently fetched dataset
-    key = st.session_state["last_fetched"]
-    if key and key in st.session_state["datasets"]:
-        df = st.session_state["datasets"][key]
-        st.dataframe(df, use_container_width=True)
-
-        # Build CSV string once
-        buf = io.StringIO()
-        df.to_csv(buf)
-        csv_str = buf.getvalue()
-
-        dl_col, cp_col = st.columns(2)
-        with dl_col:
-            st.download_button(
-                label="⬇ Download CSV",
-                data=csv_str,
-                file_name=f"{key}.csv",
-                mime="text/csv",
-                width="stretch",
-            )
-        with cp_col:
-            st.components.v1.html( # type: ignore
-                _copy_button_html(csv_str),
-                height=46,
-            )
-
-# ─────────────────────────────────────────────────────────────────────────────
 elif page == "AI Fetch":
+    import os as _os  # noqa: PLC0415
+
     st.subheader("AI-Powered Data Fetch")
     st.caption(
         "Describe the stock or instrument in plain language. "
-        "The agent uses a local Ollama LLM + DuckDuckGo to resolve the ticker, "
+        "The agent searches Yahoo Finance and uses Gemini AI + Google Search to resolve the ticker, "
         "then downloads OHLCV data from yfinance (with stooq.com as fallback)."
     )
 
+    # ── Gemini API key (never shown in UI) ────────────────────────────────
+    _gemini_key: str = _os.getenv("GEMINI_API_KEY", "")
+    try:
+        _gemini_key = _gemini_key or st.secrets.get("GEMINI_API_KEY", "")
+    except Exception:
+        pass
+
+    if not _gemini_key:
+        st.error(
+            "Gemini API key not configured. "
+            "Set `GEMINI_API_KEY` in `.streamlit/secrets.toml` or your environment."
+        )
+        st.stop()
+
+    # ── Query inputs ───────────────────────────────────────────────────────
     col_q, col_d = st.columns([3, 1])
     with col_q:
         ai_query = st.text_input(
@@ -162,75 +159,311 @@ elif page == "AI Fetch":
     with col_d:
         ai_from_date = st.date_input("From Date", key="ai_from_date")
 
-    with st.expander("Advanced", expanded=False):
-        ai_model = st.text_input(
-            "Ollama model",
-            value="llama3.1:8b",
-            help="Run `ollama list` to see installed models. Pull with `ollama pull llama3.1:8b`.",
-            key="ai_model",
-        )
-
+    # ── Fetch button ───────────────────────────────────────────────────────
     if st.button("Fetch with AI Agent", type="primary"):
         if not ai_query.strip():
             st.warning("Please enter a query.")
         else:
+            # Reset candidate state for a fresh query
+            st.session_state["ai_candidates"] = None
+            st.session_state["ai_pending_query"] = ai_query.strip()
+            st.session_state["ai_pending_date"] = str(ai_from_date)
+
+            try:
+                from fetch_data_agent import FetchDataAgent, ResolveResult  # noqa: PLC0415
+
+                agent = FetchDataAgent(api_key=_gemini_key)
+                _cache_key = ai_query.strip().upper()
+
+                with st.status("Resolving ticker…", expanded=True) as _status:
+                    def _log(msg: str) -> None:  # noqa: E306
+                        st.write(msg)
+
+                    result: ResolveResult = agent.resolve(ai_query.strip(), log=_log)
+
+                    if result.status == "direct":
+                        _status.update(
+                            label=f"Ticker resolved: {result.ticker}", state="running"
+                        )
+                        try:
+                            df = agent.fetch_ticker(
+                                result.ticker,  # type: ignore[arg-type]
+                                str(ai_from_date),
+                                cache_key=_cache_key,
+                                log=_log,
+                            )
+                            _status.update(
+                                label=f"Done — fetched {len(df)} rows ({result.ticker})",
+                                state="complete",
+                            )
+                            ai_key = f"{_cache_key.replace(' ', '_')}_{ai_from_date}"
+                            st.session_state["datasets"][ai_key] = df
+                            st.session_state["last_fetched"] = ai_key
+                            _dedup_datasets()
+                            st.success(
+                                f"Fetched **{len(df)} rows** for "
+                                f"**{result.ticker_name or ai_query}** "
+                                f"(`{result.ticker}`) — added as `{ai_key}`"
+                            )
+                            st.dataframe(df, use_container_width=True)
+                            _buf = io.StringIO()
+                            df.to_csv(_buf)
+                            _csv = _buf.getvalue()
+                            _dl, _cp = st.columns(2)
+                            with _dl:
+                                st.download_button(
+                                    "⬇ Download CSV", _csv,
+                                    file_name=f"{ai_key}.csv", mime="text/csv",
+                                    use_container_width=True,
+                                )
+                            with _cp:
+                                st.components.v1.html(  # type: ignore
+                                    _copy_button_html(_csv), height=46
+                                )
+                        except RuntimeError as _exc:
+                            _status.update(label=f"Failed: {_exc}", state="error")
+                            st.error(str(_exc))
+
+                    elif result.status == "candidates":
+                        _status.update(
+                            label=(
+                                f"Found {len(result.candidates)} possible matches "  # type: ignore[arg-type]
+                                "— please select one below"
+                            ),
+                            state="complete",
+                        )
+                        st.session_state["ai_candidates"] = result.candidates
+
+                    else:
+                        _status.update(label=f"Could not resolve: {result.message}", state="error")
+                        st.error(result.message)
+
+            except Exception as exc:
+                st.error(f"Unexpected error: {exc}")
+
+    # ── Candidate selection UI (shown when resolve returned multiple matches) ─
+    _candidates = st.session_state.get("ai_candidates")   # list[dict] or None
+    _pq = st.session_state.get("ai_pending_query")        # str or None
+    _pd = st.session_state.get("ai_pending_date")         # str or None
+
+    if _candidates and _pq and _pd:
+        st.divider()
+        st.markdown("### Select the correct instrument")
+        st.caption(
+            f'Multiple matches found for **"{_pq}"**. '
+            "Pick the one you meant, then click **Confirm & Fetch**."
+        )
+
+        _options = [
+            f"{c['ticker']}  —  {c['name']}  ({c.get('description', '')})"
+            for c in _candidates
+        ]
+        _sel_idx: int = st.radio(  # type: ignore[assignment]
+            "Instrument",
+            options=list(range(len(_options))),
+            format_func=lambda i: _options[i],
+            label_visibility="collapsed",
+            key="ai_candidate_radio",
+        )
+
+        if st.button("Confirm & Fetch", type="primary", key="ai_confirm_btn"):
+            _chosen = _candidates[_sel_idx]
+            _ticker = _chosen["ticker"]
+
             try:
                 from fetch_data_agent import FetchDataAgent  # noqa: PLC0415
 
-                agent = FetchDataAgent(model=ai_model)
+                agent = FetchDataAgent(api_key=_gemini_key)
 
-                with st.status("Running AI agent…", expanded=True) as _status:
-                    def _log(msg: str) -> None:
+                with st.status(f"Fetching data for {_ticker}…", expanded=True) as _status:
+                    def _log2(msg: str) -> None:  # noqa: E306
                         st.write(msg)
 
                     try:
-                        df = agent.fetch(ai_query.strip(), str(ai_from_date), log=_log)
+                        df = agent.fetch_ticker(
+                            _ticker, _pd,
+                            cache_key=_pq.upper(),
+                            log=_log2,
+                        )
                         _status.update(
-                            label=f"Done — fetched {len(df)} rows", state="complete"
+                            label=f"Done — fetched {len(df)} rows ({_ticker})",
+                            state="complete",
                         )
                     except Exception as _exc:
                         _status.update(label=f"Failed: {_exc}", state="error")
                         raise
 
-                ai_key = f"{ai_query.strip().upper().replace(' ', '_')}_{ai_from_date}"
+                # Clear candidate state
+                st.session_state["ai_candidates"] = None
+                st.session_state["ai_pending_query"] = None
+                st.session_state["ai_pending_date"] = None
+
+                ai_key = f"{_pq.upper().replace(' ', '_')}_{_pd}"
                 st.session_state["datasets"][ai_key] = df
                 st.session_state["last_fetched"] = ai_key
-                st.success(f"Fetched **{len(df)} rows** for **{ai_query}** — added to datasets as `{ai_key}`")
-
+                _dedup_datasets()
+                st.success(
+                    f"Fetched **{len(df)} rows** for **{_chosen['name']}** "
+                    f"(`{_ticker}`) — added as `{ai_key}`"
+                )
                 st.dataframe(df, use_container_width=True)
-
-                buf = io.StringIO()
-                df.to_csv(buf)
-                csv_str = buf.getvalue()
-
-                dl_col, cp_col = st.columns(2)
-                with dl_col:
+                _buf2 = io.StringIO()
+                df.to_csv(_buf2)
+                _csv2 = _buf2.getvalue()
+                _dl2, _cp2 = st.columns(2)
+                with _dl2:
                     st.download_button(
-                        label="⬇ Download CSV",
-                        data=csv_str,
-                        file_name=f"{ai_key}.csv",
-                        mime="text/csv",
+                        "⬇ Download CSV", _csv2,
+                        file_name=f"{ai_key}.csv", mime="text/csv",
                         use_container_width=True,
                     )
-                with cp_col:
+                with _cp2:
                     st.components.v1.html(  # type: ignore
-                        _copy_button_html(csv_str),
-                        height=46,
+                        _copy_button_html(_csv2), height=46
                     )
 
             except RuntimeError as exc:
-                if "Ollama" in str(exc):
-                    st.error(str(exc))
-                    st.info(
-                        "**Quick setup:**\n"
-                        "1. Download Ollama → https://ollama.com\n"
-                        "2. In a terminal: `ollama serve`\n"
-                        f"3. Pull the model: `ollama pull llama3.1:8b`"
-                    )
-                else:
-                    st.error(str(exc))
+                st.error(str(exc))
             except Exception as exc:
                 st.error(f"Unexpected error: {exc}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+elif page == "Screener":
+    st.subheader("Screener.in Stock Screener")
+    st.caption(
+        "Enter a screener.in query to fetch matching stocks. "
+        "Results are grouped by industry using data from yfinance."
+    )
+
+    # ── Setup instructions ─────────────────────────────────────────────────────
+    with st.expander("First-time setup (one-time)", expanded=False):
+        st.markdown(
+            """
+**How to get your session cookie** (takes ~1 minute, only needed once):
+
+1. Open **screener.in** in Chrome or Firefox and log in with Google
+2. Press **F12** to open DevTools
+3. Go to **Application** tab (Chrome) → **Cookies** → `https://www.screener.in`
+   *(Firefox: Storage tab → Cookies)*
+4. Find the cookie named **`sessionid`** and copy its **Value**
+5. Open **`secrets.txt`** in the repo root and replace the placeholder:
+   ```
+   SCREENER_SESSION=paste_the_value_here
+   ```
+
+The session lasts ~2 weeks. When it expires, just repeat steps 1-5.
+"""
+        )
+
+    # ── Query syntax help ───────────────────────────────────────────────────────
+    with st.expander("Query syntax help", expanded=False):
+        st.markdown(
+            """
+**Examples**
+```
+Market Capitalization > 500 AND PE < 20
+ROCE > 15 AND Debt to equity < 1
+Sales growth 3Years > 10 AND Return on equity > 16
+```
+**Common fields:** `Market Capitalization`, `PE`, `ROCE`, `Dividend Yield`,
+`Debt to equity`, `Sales growth 3Years`, `Return on equity`, `Price to book value`.
+
+Use `AND` / `OR` to combine conditions.
+Full reference: [screener.in query docs](https://www.screener.in/screen/raw/)
+"""
+        )
+
+    _DEFAULT_QUERY = (
+        "Return on capital employed > 20\n"
+        "AND Return on equity > 20\n"
+        "AND Debt to equity < 0.3\n"
+        "AND Sales growth 5Years > 12\n"
+        "AND Profit growth 5Years > 15\n"
+        "AND PEG Ratio < 2\n"
+        "AND OPM  > 18\n"
+        "AND Current ratio > 1.5\n"
+        "AND Market Capitalization > 10000"
+    )
+
+    screener_query = st.text_area(
+        "Query",
+        value=_DEFAULT_QUERY,
+        height=200,
+        key="screener_query",
+    )
+
+    if st.button("Run Screener", type="primary", key="screener_run"):
+        if not screener_query.strip():
+            st.warning("Please enter a query.")
+        else:
+            try:
+                from screener_fetch import run_screener_query  # noqa: PLC0415
+
+                with st.status("Running screener query…", expanded=True) as _sc_status:
+                    def _sc_log(msg: str) -> None:
+                        st.write(msg)
+
+                    try:
+                        grouped = run_screener_query(
+                            screener_query.strip(),
+                            log_callback=_sc_log,
+                        )
+                        total_stocks = sum(len(v) for v in grouped.values())
+                        _sc_status.update(
+                            label=f"Done — {total_stocks} stocks in {len(grouped)} industries",
+                            state="complete",
+                        )
+                    except Exception as _exc:
+                        _sc_status.update(label=f"Failed: {_exc}", state="error")
+                        raise
+
+                st.session_state["screener_results"] = grouped
+
+            except RuntimeError as exc:
+                st.error(str(exc))
+            except Exception as exc:
+                st.error(f"Unexpected error: {exc}")
+
+    # ── Display results ────────────────────────────────────────────────────────
+    grouped = st.session_state.get("screener_results", {})
+    if grouped:
+        total_stocks = sum(len(v) for v in grouped.values())
+        st.markdown(f"### Results — {total_stocks} stocks across {len(grouped)} industries")
+
+        # Sort industries by number of stocks descending
+        sorted_industries = sorted(grouped.items(), key=lambda x: len(x[1]), reverse=True)
+
+        # Metric columns returned by screener.in (display subset)
+        DISPLAY_COLS = ["name", "ticker", "CMP Rs.", "P/E", "Mar Cap Rs.Cr.", "ROCE %"]
+
+        for industry, stocks in sorted_industries:
+            header = f"{industry}  ({len(stocks)} stock{'s' if len(stocks) != 1 else ''})"
+            with st.expander(header, expanded=True):
+                rows = []
+                for s in stocks:
+                    row: dict = {}
+                    row["Name"] = s.get("name", "")
+                    row["Ticker"] = s.get("ticker", "")
+                    for col in ["CMP Rs.", "P/E", "Mar Cap Rs.Cr.", "ROCE %"]:
+                        val = s.get(col)
+                        if val is not None:
+                            row[col] = val
+                    row["Screener Link"] = s.get("screener_url", "")
+                    rows.append(row)
+
+                df_industry = pd.DataFrame(rows)
+
+                # Make Screener Link clickable
+                if "Screener Link" in df_industry.columns:
+                    df_industry["Screener Link"] = df_industry["Screener Link"].apply(
+                        lambda u: f'<a href="{u}" target="_blank">View</a>' if u else ""
+                    )
+                    st.markdown(
+                        df_industry.to_html(escape=False, index=False),
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.dataframe(df_industry, use_container_width=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
 elif page == "Section 2":

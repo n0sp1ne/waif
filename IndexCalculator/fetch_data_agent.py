@@ -1,39 +1,36 @@
 """
 AI-powered stock data fetch agent.
 
-Uses a local Ollama LLM to resolve natural-language queries to ticker symbols,
-searches the web via DuckDuckGo when the LLM alone is uncertain, and downloads
+Uses Google Gemini API (free tier, gemini-2.0-flash) with built-in Google Search
+grounding to resolve natural-language queries to ticker symbols, then downloads
 OHLCV data from yfinance (primary) or stooq.com (fallback).
 
 Setup
 -----
-1. Install Ollama:  https://ollama.com
-2. Run:  ollama serve
-3. Pull a model:  ollama pull llama3.2
+1. Get a free Gemini API key: https://aistudio.google.com/apikey
+2. Set GEMINI_API_KEY in your environment, a .env file, or pass directly.
 
-Python deps (see requirements.txt): ollama, duckduckgo-search, requests
+Python deps: google-genai, yfinance, requests, pandas
 """
 
 from __future__ import annotations
 
 import json
 import re
-import sys
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from io import StringIO
 from pathlib import Path
-from typing import Callable, cast
+from typing import Callable, Literal, cast
 
 import pandas as pd
 import requests
 import yfinance as yf
-from duckduckgo_search import DDGS
 
 # ── Ticker cache ──────────────────────────────────────────────────────────────
-# Discovered tickers are persisted here so future queries skip the LLM entirely.
+# Confirmed tickers are persisted here so future lookups skip the AI entirely.
 _CACHE_PATH = Path(__file__).parent / "ticker_cache.json"
 
-# Well-known NSE symbols (mirrors fetch_data.INDEX_MAP).
 _BASE_MAP: dict[str, str] = {
     "NIFTY":       "^NSEI",
     "NIFTY50":     "^NSEI",
@@ -52,7 +49,6 @@ def _load_cache() -> dict[str, str]:
     if _CACHE_PATH.exists():
         try:
             data = json.loads(_CACHE_PATH.read_text())
-            # Base map takes priority so indices never get overwritten.
             return {**data, **_BASE_MAP}
         except Exception:
             pass
@@ -60,9 +56,23 @@ def _load_cache() -> dict[str, str]:
 
 
 def _save_cache(cache: dict[str, str]) -> None:
-    # Persist only non-base entries (base map is always baked in at load time).
     to_save = {k: v for k, v in cache.items() if k not in _BASE_MAP}
     _CACHE_PATH.write_text(json.dumps(to_save, indent=2))
+
+
+# ── Result type ───────────────────────────────────────────────────────────────
+
+@dataclass
+class ResolveResult:
+    """Returned by FetchDataAgent.resolve()."""
+    status: Literal["direct", "candidates", "failed"]
+    # "direct": one confident match
+    ticker: str | None = None
+    ticker_name: str | None = None
+    # "candidates": user must choose
+    candidates: list[dict] | None = field(default=None)
+    # human-readable summary of what happened
+    message: str = ""
 
 
 # ── Agent ─────────────────────────────────────────────────────────────────────
@@ -73,105 +83,118 @@ class FetchDataAgent:
 
     Parameters
     ----------
-    model : str
-        Ollama model name.  Run ``ollama list`` to see what you have pulled.
-        Recommended: ``llama3.2``  or  ``mistral``
+    api_key : str
+        Google Gemini API key.  Free key: https://aistudio.google.com/apikey
     """
 
-    def __init__(self, model: str = "llama3.1:8b") -> None:
-        self.model = model
+    def __init__(self, api_key: str) -> None:
+        if not api_key:
+            raise ValueError(
+                "Gemini API key is required.\n"
+                "Get a free key at https://aistudio.google.com/apikey\n"
+                "Then set GEMINI_API_KEY in your environment."
+            )
+        self.api_key = api_key
         self._cache = _load_cache()
-        self._ollama_ok: bool | None = None
 
-    # ── Ollama health-check ────────────────────────────────────────────────
+    # ── Yahoo Finance symbol search ────────────────────────────────────────
 
-    def _ensure_ollama(self) -> None:
-        if self._ollama_ok:
-            return
-        try:
-            import ollama as _ol
-            _ol.list()
-            self._ollama_ok = True
-        except Exception as exc:
-            raise RuntimeError(
-                "Ollama server not reachable.\n"
-                "  1. Install:  https://ollama.com\n"
-                "  2. Start:    ollama serve\n"
-                f"  3. Pull:     ollama pull {self.model}\n"
-                f"Original error: {exc}"
-            ) from exc
-
-    # ── LLM: resolve query → ticker ────────────────────────────────────────
-
-    def _llm_resolve(self, query: str, context: str = "") -> str:
-        import ollama as _ol  # imported lazily so the class is importable without ollama
-        self._ensure_ollama()
-
-        system = (
-            "You are a financial ticker resolver. "
-            "Respond with ONLY the yfinance ticker symbol — "
-            "no explanation, no punctuation, no extra words."
-        )
-        user = (
-            f'Identify the yfinance ticker for: "{query}"\n\n'
-            "Rules:\n"
-            "- Indian NSE equities   → append .NS   (e.g. RELIANCE → RELIANCE.NS)\n"
-            "- Indian BSE equities   → append .BO\n"
-            "- Indian indices        → NIFTY 50 → ^NSEI | BANK NIFTY → ^NSEBANK | SENSEX → ^BSESN\n"
-            "- US stocks             → standard symbol (AAPL, MSFT, GOOGL)\n"
-            "- US ETFs               → SPY, QQQ, GLD, etc.\n"
-            "- Global indices        → S&P 500 → ^GSPC | NASDAQ → ^IXIC | Dow Jones → ^DJI\n"
-        )
-        if context:
-            user += f"\nAdditional context from a web search:\n{context}\n"
-        user += "\nTicker:"
-
-        resp = _ol.chat(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user",   "content": user},
-            ],
-            options={"temperature": 0},
-        )
-        raw = resp["message"]["content"].strip()
-        # Strip quotes / whitespace / "Ticker:" prefix that some models add.
-        ticker = re.sub(r'["`\'\s]', "", raw).upper()
-        ticker = re.sub(r"^TICKER[:\-]?", "", ticker)
-        return ticker
-
-    # ── Tool: yfinance symbol search ───────────────────────────────────────
-
-    def _yf_search(self, query: str) -> str | None:
-        """
-        Use Yahoo Finance's own search API to find the best matching ticker.
-        Returns the top equity ticker or None if nothing useful is found.
-        """
+    def _yf_search(self, query: str) -> list[dict]:
+        """Return up to 5 yfinance search results (raw dicts)."""
         try:
             results = yf.Search(query, max_results=5).quotes
-            if not results:
-                return None
-            # Prefer NSE equity → BSE equity → any equity, in that order.
-            for exchange_pref in ("NSI", "BSE", None):
-                for r in results:
-                    if r.get("quoteType") != "EQUITY":
-                        continue
-                    if exchange_pref is None or r.get("exchange") == exchange_pref:
-                        return r.get("symbol")
-            return None
+            return [r for r in (results or []) if r.get("symbol")]
         except Exception:
-            return None
+            return []
 
-    # ── Tool: DuckDuckGo web search ────────────────────────────────────────
+    # ── Gemini + Google Search grounding ──────────────────────────────────
 
-    def _search_web(self, query: str, n: int = 5) -> list[dict]:
+    def _gemini_resolve(self, query: str, log: Callable[[str], None]) -> ResolveResult:
+        """
+        Ask Gemini (with Google Search grounding) to find the yfinance ticker.
+        Returns a ResolveResult with status "direct", "candidates", or "failed".
+        """
         try:
-            with DDGS() as ddgs:
-                return list(ddgs.text(query, max_results=n))
-        except Exception as exc:
-            return [{"title": "Search error", "body": str(exc), "href": ""}]
+            from google import genai
+            from google.genai import types
+        except ImportError:
+            raise RuntimeError(
+                "google-genai not installed.  Run: pip install google-genai"
+            )
 
-    # ── Tool: yfinance ─────────────────────────────────────────────────────
+        client = genai.Client(api_key=self.api_key)
+
+        prompt = (
+            f'Search the web and find the yfinance ticker symbol for: "{query}"\n\n'
+            "Rules for ticker format:\n"
+            "- Indian NSE equities  → append .NS   (RELIANCE → RELIANCE.NS)\n"
+            "- Indian BSE equities  → append .BO\n"
+            "- Indian indices       → NIFTY 50 = ^NSEI | BANK NIFTY = ^NSEBANK | SENSEX = ^BSESN\n"
+            "- US stocks            → standard symbol (AAPL, MSFT, GOOGL)\n"
+            "- US ETFs              → SPY, QQQ, GLD, etc.\n"
+            "- Global indices       → S&P 500 = ^GSPC | NASDAQ = ^IXIC | Dow Jones = ^DJI\n\n"
+            "If you are confident there is ONE correct answer, respond with ONLY this JSON:\n"
+            '{"status":"direct","ticker":"TICKER_SYMBOL","name":"Full Instrument Name"}\n\n'
+            "If the query is ambiguous or there are multiple plausible matches, respond with ONLY:\n"
+            '{"status":"candidates","candidates":[\n'
+            '  {"ticker":"T1","name":"Name 1","description":"Exchange · type"},\n'
+            '  {"ticker":"T2","name":"Name 2","description":"Exchange · type"}\n'
+            "]}\n\n"
+            "Output ONLY valid JSON — no markdown fences, no explanation."
+        )
+
+        try:
+            response = client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    tools=[types.Tool(google_search=types.GoogleSearch())],
+                    temperature=0,
+                ),
+            )
+            raw = (response.text or "").strip()
+            log(f"AI response: {raw[:300]}")
+
+            # Strip markdown code fences if the model added them
+            raw = re.sub(r"^```(?:json)?\s*", "", raw).strip()
+            raw = re.sub(r"\s*```$", "", raw).strip()
+
+            match = re.search(r"\{.*\}", raw, re.DOTALL)
+            if not match:
+                return ResolveResult(
+                    status="failed",
+                    message=f"Could not parse AI response: {raw[:120]}"
+                )
+
+            data = json.loads(match.group())
+
+            if data.get("status") == "direct":
+                ticker = str(data.get("ticker", "")).strip().upper()
+                name = str(data.get("name", ticker))
+                return ResolveResult(
+                    status="direct",
+                    ticker=ticker,
+                    ticker_name=name,
+                    message=f"AI found: {name} ({ticker})",
+                )
+
+            if data.get("status") == "candidates":
+                candidates = data.get("candidates", [])
+                return ResolveResult(
+                    status="candidates",
+                    candidates=candidates,
+                    message=f"AI found {len(candidates)} possible matches",
+                )
+
+            return ResolveResult(
+                status="failed",
+                message=f"Unexpected AI response structure: {raw[:120]}"
+            )
+
+        except Exception as exc:
+            return ResolveResult(status="failed", message=f"Gemini API error: {exc}")
+
+    # ── yfinance data download ─────────────────────────────────────────────
 
     def _yf_fetch(self, ticker: str, from_date: str) -> pd.DataFrame | None:
         try:
@@ -195,7 +218,7 @@ class FetchDataAgent:
         except Exception:
             return None
 
-    # ── Tool: stooq.com CSV download ───────────────────────────────────────
+    # ── stooq.com fallback ─────────────────────────────────────────────────
 
     _YF_TO_STOOQ: dict[str, str] = {
         "^NSEI":    "^NF",
@@ -220,28 +243,22 @@ class FetchDataAgent:
         try:
             d1 = datetime.strptime(from_date, "%Y-%m-%d").strftime("%Y%m%d")
             d2 = date.today().strftime("%Y%m%d")
-            url = (
-                f"https://stooq.com/q/d/l/"
-                f"?s={stooq_ticker.lower()}&d1={d1}&d2={d2}&i=d"
-            )
+            url = f"https://stooq.com/q/d/l/?s={stooq_ticker.lower()}&d1={d1}&d2={d2}&i=d"
             resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
             if resp.status_code != 200:
                 return None
             text = resp.text.strip()
             if not text or "No data" in text or len(text.splitlines()) < 2:
                 return None
-
             df = pd.read_csv(StringIO(text), parse_dates=["Date"], index_col="Date")
             if df.empty:
                 return None
-
             df.columns = [c.strip().title() for c in df.columns]
             for col in ["Open", "High", "Low", "Close"]:
                 if col in df.columns:
                     df[col] = pd.to_numeric(df[col], errors="coerce")
             if "Volume" not in df.columns:
                 df["Volume"] = 0
-
             df = df[["Open", "High", "Low", "Close", "Volume"]]
             df = df[df["Close"].notna()]
             df.index.name = "Date"
@@ -249,43 +266,140 @@ class FetchDataAgent:
         except Exception:
             return None
 
-    # ── Persist resolved ticker ────────────────────────────────────────────
-
     def _persist(self, cache_key: str, ticker: str) -> None:
         self._cache[cache_key] = ticker
         _save_cache(self._cache)
 
     # ── Public API ─────────────────────────────────────────────────────────
 
-    def fetch(
+    def resolve(
         self,
         query: str,
-        from_date: str,
         log: Callable[[str], None] | None = None,
-    ) -> pd.DataFrame:
+    ) -> ResolveResult:
         """
-        Resolve *query* to a stock ticker and return OHLCV data.
-
-        Parameters
-        ----------
-        query : str
-            Natural language or raw ticker — e.g. ``"Reliance"``, ``"AAPL"``,
-            ``"Nifty Bank"``, ``"Apple Inc"``.
-        from_date : str
-            Start date — ``DD-MM-YYYY`` or ``YYYY-MM-DD``.
-        log : callable, optional
-            Status callback for progress messages (e.g. ``print`` or
-            a Streamlit ``st.write``-like function).
+        Phase 1 — resolve a natural-language query to a ticker symbol.
 
         Returns
         -------
-        pd.DataFrame
-            Indexed by Date with columns: Open, High, Low, Close, Volume.
+        ResolveResult
+            status="direct"     → single confident match; .ticker is populated
+            status="candidates" → multiple plausible matches; .candidates is populated
+            status="failed"     → could not resolve; .message explains why
         """
         def _log(msg: str) -> None:
             (log or print)(msg)
 
-        # ── Normalise date ──────────────────────────────────────────────────
+        cache_key = query.strip().upper()
+
+        # ── Cache ──────────────────────────────────────────────────────────
+        if cache_key in self._cache:
+            ticker = self._cache[cache_key]
+            _log(f"Cache hit: {cache_key!r} → {ticker}")
+            return ResolveResult(
+                status="direct",
+                ticker=ticker,
+                ticker_name=ticker,
+                message=f"Cached: {ticker}",
+            )
+
+        # ── Yahoo Finance symbol search ────────────────────────────────────
+        _log(f"Searching Yahoo Finance for '{query}'…")
+        yf_results = self._yf_search(query)
+
+        if yf_results:
+            first = yf_results[0]
+            first_ticker = first.get("symbol", "")
+            first_name = (
+                first.get("longname") or first.get("shortname") or first_ticker
+            )
+
+            # Exact ticker entered (e.g. "AAPL", "RELIANCE", "RELIANCE.NS")
+            query_norm = cache_key.replace(" ", "")
+            ticker_base = re.sub(r"\.(NS|BO)$", "", first_ticker.upper())
+            is_exact = (
+                ticker_base == query_norm
+                or first_ticker.upper() == query_norm
+            )
+            if is_exact:
+                _log(f"Exact ticker match: {first_name} ({first_ticker})")
+                return ResolveResult(
+                    status="direct",
+                    ticker=first_ticker,
+                    ticker_name=first_name,
+                    message=f"Exact match: {first_name}",
+                )
+
+            # Single unambiguous result
+            if len(yf_results) == 1:
+                _log(f"Single Yahoo Finance result: {first_name} ({first_ticker})")
+                return ResolveResult(
+                    status="direct",
+                    ticker=first_ticker,
+                    ticker_name=first_name,
+                    message=f"Best match: {first_name}",
+                )
+
+            # Multiple results → surface as candidates for the user
+            candidates = [
+                {
+                    "ticker": r.get("symbol", ""),
+                    "name": (
+                        r.get("longname") or r.get("shortname") or r.get("symbol", "")
+                    ),
+                    "description": (
+                        f"{r.get('exchange', '?')} · {r.get('quoteType', '?')}"
+                    ),
+                }
+                for r in yf_results[:4]
+                if r.get("symbol")
+            ]
+            if len(candidates) > 1:
+                _log(
+                    f"Yahoo Finance returned {len(candidates)} candidates "
+                    "— waiting for user selection"
+                )
+                return ResolveResult(
+                    status="candidates",
+                    candidates=candidates,
+                    message=f"Found {len(candidates)} possible matches on Yahoo Finance",
+                )
+            if candidates:
+                return ResolveResult(
+                    status="direct",
+                    ticker=candidates[0]["ticker"],
+                    ticker_name=candidates[0]["name"],
+                    message=f"Best match: {candidates[0]['name']}",
+                )
+
+        # ── Gemini + Google Search ─────────────────────────────────────────
+        _log("No confident match from Yahoo Finance — querying AI with web search…")
+        return self._gemini_resolve(query, _log)
+
+    def fetch_ticker(
+        self,
+        ticker: str,
+        from_date: str,
+        cache_key: str | None = None,
+        log: Callable[[str], None] | None = None,
+    ) -> pd.DataFrame:
+        """
+        Phase 2 — download OHLCV data for a confirmed ticker.
+
+        Parameters
+        ----------
+        ticker : str
+            yfinance-format ticker (e.g. "RELIANCE.NS", "^NSEI", "AAPL").
+        from_date : str
+            Start date — DD-MM-YYYY or YYYY-MM-DD.
+        cache_key : str, optional
+            Original query string; if given, the ticker is cached for future use.
+        log : callable, optional
+            Progress callback.
+        """
+        def _log(msg: str) -> None:
+            (log or print)(msg)
+
         for fmt in ("%d-%m-%Y", "%Y-%m-%d", "%d/%m/%Y"):
             try:
                 norm_date = str(datetime.strptime(from_date.strip(), fmt).date())
@@ -294,81 +408,28 @@ class FetchDataAgent:
                 continue
         else:
             raise ValueError(
-                f"Unrecognised date format: '{from_date}'.  "
-                "Use DD-MM-YYYY or YYYY-MM-DD."
+                f"Unrecognised date format: '{from_date}'.  Use YYYY-MM-DD."
             )
 
-        cache_key = query.strip().upper()
-
-        # ── Step 1: Cache lookup ────────────────────────────────────────────
-        if cache_key in self._cache:
-            ticker = self._cache[cache_key]
-            _log(f"Cache hit: {cache_key!r} → {ticker}")
-            df = self._yf_fetch(ticker, norm_date)
-            if df is not None:
-                _log(f"Fetched {len(df)} rows from yfinance ({ticker})")
-                return df
-            _log(f"Cached ticker {ticker!r} returned no data — re-resolving")
-
-        # ── Step 2: Yahoo Finance symbol search ────────────────────────────
-        _log(f"Searching Yahoo Finance for '{query}'…")
-        ticker = self._yf_search(query)
-        if ticker:
-            _log(f"Yahoo Finance search → {ticker}")
-            df = self._yf_fetch(ticker, norm_date)
-            if df is not None:
-                _log(f"Fetched {len(df)} rows from yfinance ({ticker})")
+        _log(f"Downloading data for {ticker} from yfinance…")
+        df = self._yf_fetch(ticker, norm_date)
+        if df is not None:
+            _log(f"Fetched {len(df)} rows from yfinance ({ticker})")
+            if cache_key:
                 self._persist(cache_key, ticker)
-                return df
-            _log(f"Ticker {ticker!r} found but returned no data — trying LLM")
-        else:
-            _log("No results from Yahoo Finance search — trying LLM")
-
-        # ── Step 3: LLM first pass (no web context) ─────────────────────────
-        _log(f"Asking LLM to resolve '{query}'…")
-        ticker = self._llm_resolve(query)
-        _log(f"LLM suggested: {ticker}")
-
-        df = self._yf_fetch(ticker, norm_date)
-        if df is not None:
-            _log(f"Fetched {len(df)} rows from yfinance ({ticker})")
-            self._persist(cache_key, ticker)
             return df
 
-        # ── Step 4: DuckDuckGo search + LLM second pass ─────────────────────
-        _log(f"yfinance returned nothing for {ticker!r} — searching web…")
-        search_q = (
-            f"{query} yahoo finance ticker symbol "
-            "site:finance.yahoo.com OR site:in.finance.yahoo.com"
-        )
-        results = self._search_web(search_q)
-        context = "\n".join(
-            f"• {r.get('title', '')} — {r.get('body', '')[:200]}"
-            for r in results[:4]
-            if r.get("href")
-        )
-        _log(f"Web search returned {len(results)} results.  Re-asking LLM…")
-        ticker = self._llm_resolve(query, context)
-        _log(f"LLM (with context) → {ticker}")
-
-        df = self._yf_fetch(ticker, norm_date)
-        if df is not None:
-            _log(f"Fetched {len(df)} rows from yfinance ({ticker})")
-            self._persist(cache_key, ticker)
-            return df
-
-        # ── Step 5: stooq.com fallback ──────────────────────────────────────
         stooq_t = self._to_stooq_ticker(ticker)
-        _log(f"Trying stooq.com ({stooq_t})…")
+        _log(f"yfinance returned no data — trying stooq.com ({stooq_t})…")
         df = self._stooq_fetch(stooq_t, norm_date)
         if df is not None:
             _log(f"Fetched {len(df)} rows from stooq ({stooq_t})")
-            self._persist(cache_key, ticker)
+            if cache_key:
+                self._persist(cache_key, ticker)
             return df
 
         raise RuntimeError(
-            f"Could not fetch data for '{query}' "
-            f"(last attempted ticker: {ticker!r}).  "
+            f"Could not fetch data for '{ticker}'.  "
             "Try the exact yfinance ticker, e.g. RELIANCE.NS, ^NSEI, AAPL."
         )
 
@@ -376,21 +437,33 @@ class FetchDataAgent:
 # ── Standalone CLI ────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("=== WAIF Fetch-Data Agent (Ollama + DuckDuckGo) ===\n")
-    query     = input("Stock / Instrument (e.g. 'Reliance', 'Apple', 'Nifty'): ").strip()
-    from_date = input("From date (DD-MM-YYYY or YYYY-MM-DD)                  : ").strip()
-    save_csv  = input("Save to CSV? (y/n)                                     : ").strip().lower() == "y"
-    model     = input("Ollama model [llama3.2]                                : ").strip() or "llama3.2"
+    import os, sys
 
-    agent = FetchDataAgent(model=model)
+    print("=== WAIF Fetch-Data Agent (Gemini + Google Search) ===\n")
+    api_key = os.getenv("GEMINI_API_KEY") or input("Gemini API key: ").strip()
+    query = input("Stock / Instrument (e.g. 'Reliance', 'Apple', 'Nifty'): ").strip()
+    from_date = input("From date (DD-MM-YYYY or YYYY-MM-DD)              : ").strip()
+
+    agent = FetchDataAgent(api_key=api_key)
+    result = agent.resolve(query, log=print)
+    print(f"\nResolve result: {result}\n")
+
+    if result.status == "direct":
+        ticker = result.ticker or ""
+    elif result.status == "candidates" and result.candidates:
+        print("Candidates:")
+        for i, c in enumerate(result.candidates):
+            print(f"  [{i}] {c['ticker']} — {c['name']} ({c.get('description','')})")
+        idx = int(input("Select [0]: ").strip() or "0")
+        ticker = result.candidates[idx]["ticker"]
+    else:
+        print(f"Failed: {result.message}", file=sys.stderr)
+        sys.exit(1)
+
     try:
-        df = agent.fetch(query, from_date, log=print)
+        df = agent.fetch_ticker(ticker, from_date, cache_key=query.upper(), log=print)
         print(f"\nFetched {len(df)} rows:")
         print(df.tail(5).to_string())
-        if save_csv:
-            fname = f"{query.replace(' ', '_').upper()}_{from_date}.csv"
-            df.to_csv(fname)
-            print(f"Saved → {fname}")
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
