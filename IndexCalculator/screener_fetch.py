@@ -268,16 +268,19 @@ def _enrich_with_industry(
 def run_screener_query(
     query: str,
     log_callback=None,
+    session_id: str | None = None,
 ) -> dict[str, list[dict]]:
     """
     Run a screener.in query and return stocks grouped by industry.
 
-    Reads the session cookie from secrets.txt automatically.
+    Reads the session cookie from secrets.txt automatically, or uses
+    the session_id argument if provided (e.g. from st.secrets in deployment).
 
     Parameters
     ----------
     query        : screener.in query string
     log_callback : optional callable(str) for progress updates
+    session_id   : screener.in sessionid cookie; if None, loaded from secrets.txt
 
     Returns
     -------
@@ -289,7 +292,8 @@ def run_screener_query(
         if log_callback:
             log_callback(msg)
 
-    session_id = _load_session_id()
+    if session_id is None:
+        session_id = _load_session_id()
     session    = _make_session(session_id)
 
     log("Verifying screener.in session…")

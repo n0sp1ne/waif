@@ -404,9 +404,11 @@ Full reference: [screener.in query docs](https://www.screener.in/screen/raw/)
                         st.write(msg)
 
                     try:
+                        _screener_sid = st.secrets.get("SCREENER_SESSION") or None
                         grouped = run_screener_query(
                             screener_query.strip(),
                             log_callback=_sc_log,
+                            session_id=_screener_sid,
                         )
                         total_stocks = sum(len(v) for v in grouped.values())
                         _sc_status.update(
